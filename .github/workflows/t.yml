@@ -126,13 +126,19 @@ jobs:
 
           echo $! > /tmp/dwm.pid
 
-          # Launch Chrome
+          # Launch Chrome with WebGPU software rendering
           google-chrome \
             --no-first-run \
             --disable-default-apps \
             --disable-dev-shm-usage \
             --window-size=1280,800 \
             --user-data-dir="$HOME/chrome-profile" \
+            --enable-unsafe-webgpu \
+            --enable-features=Vulkan \
+            --use-vulkan=swiftshader \
+            --use-webgpu-adapter=swiftshader \
+            --disable-vulkan-surface \
+            --ignore-gpu-blocklist \
             about:blank \
             > /tmp/chrome.log 2>&1 &
 
@@ -232,6 +238,7 @@ jobs:
 
           echo "Remote desktop is running."
           echo "Chrome is available inside Selkies."
+          echo "WebGPU is enabled using SwiftShader."
 
           while true; do
             if ! kill -0 "$(cat /tmp/selkies.pid)" 2>/dev/null; then
