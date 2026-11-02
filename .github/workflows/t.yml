@@ -34,13 +34,9 @@ jobs:
             python3 \
             python3-pip \
             python3-venv \
-            pulseaudio \
-            pipewire \
-            pipewire-pulse \
-            wireplumber \
             jq
 
-          # Google's official Chrome repository
+          # Install Google Chrome Stable
           sudo install -d -m 0755 /etc/apt/keyrings
 
           curl -fsSL \
@@ -97,18 +93,13 @@ jobs:
             exit 1
           fi
 
-          # Virtual X11 desktop
           export DISPLAY=:99
           export XDG_RUNTIME_DIR=/tmp/runtime-runner
-          export PULSE_RUNTIME_PATH="$XDG_RUNTIME_DIR/pulse"
-          export PULSE_SERVER="unix:$PULSE_RUNTIME_PATH/native"
 
           mkdir -p "$XDG_RUNTIME_DIR"
           chmod 700 "$XDG_RUNTIME_DIR"
 
-          mkdir -p "$PULSE_RUNTIME_PATH"
-
-          # Start virtual display
+          # Start virtual X11 display
           Xvfb :99 \
             -screen 0 1920x1080x24 \
             -ac \
@@ -130,15 +121,10 @@ jobs:
 
           xdpyinfo -display :99 >/dev/null
 
-          # Start a lightweight window manager
+          # Start dwm
           dwm > /tmp/dwm.log 2>&1 &
 
           echo $! > /tmp/dwm.pid
-
-          # Start audio server
-          pulseaudio --start \
-            --exit-idle-time=-1 \
-            --daemonize=true
 
           # Launch Chrome
           google-chrome \
@@ -165,16 +151,38 @@ jobs:
 
           echo $! > /tmp/selkies.pid
 
-          # Wait for Selkies to respond
+          # Wait for Selkies.
+          # HTTP 401 is valid when authentication is enabled.
+          SELKIES_READY=false
+
           for i in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:8080/ >/dev/null; then
+            HTTP_CODE=$(curl \
+              -sS \
+              -o /dev/null \
+              -w '%{http_code}' \
+              http://127.0.0.1:8080/ \
+              || true)
+
+            if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "401" ]]; then
+              SELKIES_READY=true
+              echo "Selkies is responding. HTTP $HTTP_CODE"
               break
             fi
+
+            echo "Waiting for Selkies... HTTP ${HTTP_CODE:-000}"
 
             sleep 2
           done
 
-          echo "Desktop services started."
+          if [[ "$SELKIES_READY" != "true" ]]; then
+            echo "Selkies failed to start."
+
+            cat /tmp/selkies.log
+
+            exit 1
+          fi
+
+          echo "Desktop started successfully."
 
       - name: Start Cloudflare Quick Tunnel
         shell: bash
@@ -189,6 +197,8 @@ jobs:
           echo $! > /tmp/cloudflared.pid
 
           # Wait for the public tunnel URL
+          URL=""
+
           for i in $(seq 1 60); do
             URL=$(grep -oE \
               'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
@@ -200,15 +210,18 @@ jobs:
               echo "Cloudflare Quick Tunnel:"
               echo "$URL"
               echo "=================================="
+
               break
             fi
 
             sleep 2
           done
 
-          if [ -z "${URL:-}" ]; then
+          if [ -z "$URL" ]; then
             echo "Tunnel URL was not detected."
+
             cat /tmp/cloudflared.log
+
             exit 1
           fi
 
@@ -218,20 +231,43 @@ jobs:
           set -euo pipefail
 
           echo "Remote desktop is running."
-          echo "Chrome is available inside the Selkies desktop."
+          echo "Chrome is available inside Selkies."
 
           while true; do
             if ! kill -0 "$(cat /tmp/selkies.pid)" 2>/dev/null; then
               echo "Selkies stopped."
+
               cat /tmp/selkies.log
+
               exit 1
             fi
 
             if ! kill -0 "$(cat /tmp/cloudflared.pid)" 2>/dev/null; then
               echo "Cloudflare Tunnel stopped."
+
               cat /tmp/cloudflared.log
+
               exit 1
             fi
 
             sleep 30
           done
+
+      - name: Diagnose services
+        if: always()
+        shell: bash
+        run: |
+          echo "=== Selkies ==="
+          cat /tmp/selkies.log || true
+
+          echo "=== Chrome ==="
+          cat /tmp/chrome.log || true
+
+          echo "=== dwm ==="
+          cat /tmp/dwm.log || true
+
+          echo "=== Xvfb ==="
+          cat /tmp/xvfb.log || true
+
+          echo "=== Cloudflare ==="
+          cat /tmp/cloudflared.log || true
