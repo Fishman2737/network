@@ -1,0 +1,237 @@
+
+name: Remote Linux Browser
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  browser:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Install Linux desktop and Chrome
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            ca-certificates \
+            curl \
+            wget \
+            gnupg \
+            xvfb \
+            x11-utils \
+            x11-xserver-utils \
+            dbus-x11 \
+            dwm \
+            xterm \
+            python3 \
+            python3-pip \
+            python3-venv \
+            pulseaudio \
+            pipewire \
+            pipewire-pulse \
+            wireplumber \
+            jq
+
+          # Google's official Chrome repository
+          sudo install -d -m 0755 /etc/apt/keyrings
+
+          curl -fsSL \
+            https://dl.google.com/linux/linux_signing_key.pub \
+            | sudo gpg --dearmor \
+                -o /etc/apt/keyrings/google-chrome.gpg
+
+          echo \
+            "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
+            | sudo tee /etc/apt/sources.list.d/google-chrome.list
+
+          sudo apt-get update
+
+          sudo apt-get install -y google-chrome-stable
+
+          google-chrome --version
+
+      - name: Install Selkies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -m venv "$HOME/selkies-venv"
+
+          "$HOME/selkies-venv/bin/pip" install --upgrade pip
+
+          "$HOME/selkies-venv/bin/pip" install selkies
+
+          echo "$HOME/selkies-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install cloudflared
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl -fsSL \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o /tmp/cloudflared
+
+          sudo install -m 0755 /tmp/cloudflared \
+            /usr/local/bin/cloudflared
+
+          cloudflared --version
+
+      - name: Start desktop
+        shell: bash
+        env:
+          SELKIES_PASSWORD: ${{ secrets.SELKIES_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$SELKIES_PASSWORD" ]; then
+            echo "Set SELKIES_PASSWORD in GitHub Secrets."
+            exit 1
+          fi
+
+          # Virtual X11 desktop
+          export DISPLAY=:99
+          export XDG_RUNTIME_DIR=/tmp/runtime-runner
+          export PULSE_RUNTIME_PATH="$XDG_RUNTIME_DIR/pulse"
+          export PULSE_SERVER="unix:$PULSE_RUNTIME_PATH/native"
+
+          mkdir -p "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+
+          mkdir -p "$PULSE_RUNTIME_PATH"
+
+          # Start virtual display
+          Xvfb :99 \
+            -screen 0 1920x1080x24 \
+            -ac \
+            +extension RANDR \
+            +extension GLX \
+            -nolisten tcp \
+            > /tmp/xvfb.log 2>&1 &
+
+          echo $! > /tmp/xvfb.pid
+
+          # Wait for X11
+          for i in $(seq 1 30); do
+            if xdpyinfo -display :99 >/dev/null 2>&1; then
+              break
+            fi
+
+            sleep 1
+          done
+
+          xdpyinfo -display :99 >/dev/null
+
+          # Start a lightweight window manager
+          dwm > /tmp/dwm.log 2>&1 &
+
+          echo $! > /tmp/dwm.pid
+
+          # Start audio server
+          pulseaudio --start \
+            --exit-idle-time=-1 \
+            --daemonize=true
+
+          # Launch Chrome
+          google-chrome \
+            --no-first-run \
+            --disable-default-apps \
+            --disable-dev-shm-usage \
+            --window-size=1280,800 \
+            --user-data-dir="$HOME/chrome-profile" \
+            about:blank \
+            > /tmp/chrome.log 2>&1 &
+
+          echo $! > /tmp/chrome.pid
+
+          # Start Selkies
+          selkies \
+            --public \
+            --port=8080 \
+            --enable-https=false \
+            --basic-auth-user=browser \
+            --basic-auth-password="$SELKIES_PASSWORD" \
+            --encoder=h264enc \
+            --enable-resize=false \
+            > /tmp/selkies.log 2>&1 &
+
+          echo $! > /tmp/selkies.pid
+
+          # Wait for Selkies to respond
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8080/ >/dev/null; then
+              break
+            fi
+
+            sleep 2
+          done
+
+          echo "Desktop services started."
+
+      - name: Start Cloudflare Quick Tunnel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cloudflared tunnel \
+            --url http://localhost:8080 \
+            --no-autoupdate \
+            > /tmp/cloudflared.log 2>&1 &
+
+          echo $! > /tmp/cloudflared.pid
+
+          # Wait for the public tunnel URL
+          for i in $(seq 1 60); do
+            URL=$(grep -oE \
+              'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
+              /tmp/cloudflared.log \
+              | head -n 1 || true)
+
+            if [ -n "$URL" ]; then
+              echo "=================================="
+              echo "Cloudflare Quick Tunnel:"
+              echo "$URL"
+              echo "=================================="
+              break
+            fi
+
+            sleep 2
+          done
+
+          if [ -z "${URL:-}" ]; then
+            echo "Tunnel URL was not detected."
+            cat /tmp/cloudflared.log
+            exit 1
+          fi
+
+      - name: Keep desktop running
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Remote desktop is running."
+          echo "Chrome is available inside the Selkies desktop."
+
+          while true; do
+            if ! kill -0 "$(cat /tmp/selkies.pid)" 2>/dev/null; then
+              echo "Selkies stopped."
+              cat /tmp/selkies.log
+              exit 1
+            fi
+
+            if ! kill -0 "$(cat /tmp/cloudflared.pid)" 2>/dev/null; then
+              echo "Cloudflare Tunnel stopped."
+              cat /tmp/cloudflared.log
+              exit 1
+            fi
+
+            sleep 30
+          done
